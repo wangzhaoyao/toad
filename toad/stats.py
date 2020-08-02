@@ -1,71 +1,33 @@
-from multiprocessing import Pool, cpu_count
+from joblib import Parallel, delayed
 
 import numpy as np
 import pandas as pd
 
 from scipy import stats
-from sklearn.metrics import f1_score
 from .merge import merge
 
 from .utils import (
     np_count,
+    np_unique,
     to_ndarray,
     feature_splits,
     is_continuous,
     inter_feature,
-    iter_df,
+    split_target,
 )
 
-def KS(score, target):
-    """calculate ks value
-    """
-    df = pd.DataFrame({
-        'score': score,
-        'target': target,
-    })
-    df = df.sort_values(by='score', ascending=False)
-    df['good'] = 1 - df['target']
-    df['bad_rate'] = df['target'].cumsum() / df['target'].sum()
-    df['good_rate'] = df['good'].cumsum() / df['good'].sum()
-    df['ks'] = df['bad_rate'] - df['good_rate']
-    return max(abs(df['ks']))
+from .utils.decorator import support_dataframe
 
-
-def KS_bucket(score, target, bucket = 10):
-    """calculate ks value by bucket
-    """
-    df = pd.DataFrame({
-        'score': score,
-        'bad': target,
-    })
-
-    df['good'] = 1 - df['bad']
-    df['bucket'] = pd.qcut(df['score'], bucket, duplicates = 'drop')
-    grouped = df.groupby('bucket', as_index = False)
-
-    agg1 = pd.DataFrame()
-    agg1['min'] = grouped.min()['score']
-    agg1['max'] = grouped.max()['score']
-    agg1['bads'] = grouped.sum()['bad']
-    agg1['goods'] = grouped.sum()['good']
-    agg1['total'] = agg1['bads'] + agg1['goods']
-
-    agg2 = (agg1.sort_values(by = 'min')).reset_index(drop = True)
-    agg2['bad_rate'] = (agg2['bads'] / agg2['total']).apply('{0:.2%}'.format)
-
-    agg2['ks'] = np.round((agg2['bads'] / agg2['bads'].sum()).cumsum() - (agg2['goods'] / agg2['goods'].sum()).cumsum(), 4) * 100
-
-    return agg2
-
-def KS_by_col(df, by='feature', score='score', target='target'):
-    """
-    """
-
-    pass
-
+STATS_EMPTY = np.nan
 
 def gini(target):
     """get gini index of a feature
+
+    Args:
+        target (array-like): list of target that will be calculate gini
+
+    Returns:
+        number: gini value
     """
     target = to_ndarray(target)
     v, c = np.unique(target, return_counts = True)
@@ -74,19 +36,33 @@ def gini(target):
 
 def _gini_cond(feature, target):
     """private conditional gini function
+
+    Args:
+        feature (numpy.ndarray)
+        target (numpy.ndarray)
+
+    Returns:
+        number: conditional gini value
     """
     size = feature.size
-    matrix = np.vstack([feature, target])
 
     value = 0
-    for v, c in zip(*np.unique(feature, return_counts = True)):
-        target_series = matrix[:, matrix[0,:] == v][1,:]
+    for v, c in zip(*np_unique(feature, return_counts = True)):
+        target_series = target[feature == v]
         value += c / size * gini(target_series)
 
     return value
 
+@support_dataframe
 def gini_cond(feature, target):
     """get conditional gini index of a feature
+
+    Args:
+        feature (array-like)
+        target (array-like)
+
+    Returns:
+        number: conditional gini value. If feature is continuous, it will return the best gini value when the feature bins into two groups
     """
     if not is_continuous(feature):
         return _gini_cond(feature, target)
@@ -103,6 +79,12 @@ def gini_cond(feature, target):
 
 def entropy(target):
     """get infomation entropy of a feature
+
+    Args:
+        target (array-like)
+
+    Returns:
+        number: information entropy
     """
     target = to_ndarray(target)
     uni, counts = np.unique(target, return_counts = True)
@@ -112,18 +94,33 @@ def entropy(target):
 
 def _entropy_cond(feature, target):
     """private conditional entropy func
+
+    Args:
+        feature (numpy.ndarray)
+        target (numpy.ndarray)
+
+    Returns:
+        number: conditional information entropy
     """
     size = len(feature)
 
     value = 0
-    for v, c in zip(*np.unique(feature, return_counts = True)):
+    for v, c in zip(*np_unique(feature, return_counts = True)):
         target_series = target[feature == v]
         value += c/size * entropy(target_series)
 
     return value
 
+@support_dataframe
 def entropy_cond(feature, target):
     """get conditional entropy of a feature
+
+    Args:
+        feature (array-like)
+        target (array-like)
+
+    Returns:
+        number: conditional information entropy. If feature is continuous, it will return the best entropy when the feature bins into two groups
     """
     feature = to_ndarray(feature)
     target = to_ndarray(target)
@@ -141,90 +138,152 @@ def entropy_cond(feature, target):
     return best
 
 
+def probability(target, mask = None):
+    """get probability of target by mask
+    """
+    if mask is None:
+        return 1, 1
+
+    counts_0 = np_count(target, 0, default = 1)
+    counts_1 = np_count(target, 1, default = 1)
+
+    sub_target = target[mask]
+
+    sub_0 = np_count(sub_target, 0, default = 1)
+    sub_1 = np_count(sub_target, 1, default = 1)
+
+    y_prob = sub_1 / counts_1
+    n_prob = sub_0 / counts_0
+
+    return y_prob, n_prob
+
+
 def WOE(y_prob, n_prob):
     """get WOE of a group
 
     Args:
         y_prob: the probability of grouped y in total y
         n_prob: the probability of grouped n in total n
+
+    Returns:
+        number: woe value
     """
     return np.log(y_prob / n_prob)
 
 
 def _IV(feature, target):
-    """
+    """private information value func
+
+    Args:
+        feature (array-like)
+        target (array-like)
+
+    Returns:
+        number: IV
+        Series: IV of each groups
     """
     feature = to_ndarray(feature)
     target = to_ndarray(target)
 
-    t_counts_0 = np_count(target, 0, default = 1)
-    t_counts_1 = np_count(target, 1, default = 1)
-
-    value = 0
+    iv = {}
 
     for v in np.unique(feature):
-        sub_target = target[feature == v]
+        y_prob, n_prob = probability(target, mask = (feature == v))
 
-        sub_0 = np_count(sub_target, 0, default = 1)
-        sub_1 = np_count(sub_target, 1, default = 1)
+        iv[v] = (y_prob - n_prob) * WOE(y_prob, n_prob)
 
-        y_prob = sub_1 / t_counts_1
-        n_prob = sub_0 / t_counts_0
-
-        value += (y_prob - n_prob) * WOE(y_prob, n_prob)
-
-    return value
+    iv = pd.Series(iv)
+    return iv.sum(), iv
 
 
-def IV(feature, target, **kwargs):
-    """get IV of a feature
+@support_dataframe
+def IV(feature, target, return_sub = False, **kwargs):
+    """get the IV of a feature
+
+    Args:
+        feature (array-like)
+        target (array-like)
+        return_sub (bool): if need return IV of each groups
+        n_bins (int): n groups that the feature will bin into
+        method (str): the strategy to be used to merge feature, default is 'dt'
+        **kwargs (): other options for merge function
     """
-    if not is_continuous(feature):
-        return _IV(feature, target)
+    if is_continuous(feature):
+        feature = merge(feature, target, **kwargs)
 
-    # df = pd.DataFrame({
-    #     feature: pd.cut(dataframe[feature], 20),
-    #     target: dataframe[target],
-    # })
+    iv, sub = _IV(feature, target)
 
-    feature = merge(feature, target, **kwargs)
-
-    return _IV(feature, target)
+    if return_sub:
+        return iv, sub
+    
+    return iv
 
 
+def badrate(target):
+    """calculate badrate
 
-def F1(score, target):
-    """
+    Args:
+        target (array-like): target array which `1` is bad
 
     Returns:
-        float: best f1 score
-        float: best spliter
+        float
     """
-    dataframe = pd.DataFrame({
-        'score': score,
-        'target': target,
-    })
+    return np.sum(target) / len(target)
 
-    # find best split for score
-    splits = feature_splits(dataframe['score'], dataframe['target'])
-    best = 0
-    split = None
-    for df, pointer in iter_df(dataframe, 'score', 'target', splits):
-        v = f1_score(df['target'], df['score'])
 
-        if v > best:
-            best = v
-            split = pointer
+def VIF(frame):
+    """calculate vif
 
-    return best, split
+    Args:
+        frame (ndarray|DataFrame)
+
+    Returns:
+        Series
+    """
+    index = None
+    if isinstance(frame, pd.DataFrame):
+        index = frame.columns
+        frame = frame.values
+    
+    from sklearn.linear_model import LinearRegression
+
+    model = LinearRegression(fit_intercept = False)
+
+    l = frame.shape[1]
+    vif = np.zeros(l)
+
+    for i in range(l):
+        X = frame[:, np.arange(l) != i]
+        y = frame[:, i]
+        model.fit(X, y)
+
+        pre_y = model.predict(X)
+
+        vif[i] = np.sum(y ** 2) / np.sum((pre_y - y) ** 2)
+    
+    return pd.Series(vif, index = index)
 
 
 def column_quality(feature, target, name = 'feature', iv_only = False, **kwargs):
+    """calculate quality of a feature
+
+    Args:
+        feature (array-like)
+        target (array-like)
+        name (str): feature's name that will be setted in the returned Series
+        iv_only (bool): if only calculate IV
+
+    Returns:
+        Series: a list of quality with the feature's name
+    """
+    feature = to_ndarray(feature)
+    target = to_ndarray(target)
+
     if not np.issubdtype(feature.dtype, np.number):
         feature = feature.astype(str)
 
-    c = len(np.unique(feature))
-    iv = g = e = '--'
+    c = len(np_unique(feature))
+    iv = g = e = STATS_EMPTY
 
     # skip when unique is too much
     if is_continuous(feature) or c / len(feature) < 0.5:
@@ -242,25 +301,35 @@ def column_quality(feature, target, name = 'feature', iv_only = False, **kwargs)
     return row
 
 
-def quality(dataframe, target = 'target', iv_only = False, **kwargs):
+def quality(dataframe, target = 'target', cpu_cores = 0, **kwargs):
     """get quality of features in data
 
+    Args:
+        dataframe (DataFrame): dataframe that will be calculate quality
+        target (str): the target's name in dataframe
+        iv_only (bool): if only calculate IV
+        cpu_cores (int): the maximun number of CPU cores will be used, `0` means all CPUs will be used, 
+            `-1` means all CPUs but one will be used.
+
     Returns:
-        dataframe
+        DataFrame: quality of features with the features' name as row name
     """
-    res = []
-    pool = Pool(cpu_count())
+    frame, target = split_target(dataframe, target)
+    
+    if cpu_cores < 1:
+        cpu_cores = cpu_cores - 1
+    
+    
+    pool = Parallel(n_jobs = cpu_cores)
 
-    for column in dataframe:
-        if column == target:
-            continue
+    jobs = []
+    for name, series in frame.iteritems():
+        jobs.append(delayed(column_quality)(series, target, name = name, **kwargs))
 
-        r = pool.apply_async(column_quality, args = (dataframe[column].values, dataframe[target].values), kwds = {'name': column, 'iv_only': iv_only, **kwargs})
-        res.append(r)
+    rows = pool(jobs)
 
-    pool.close()
-    pool.join()
 
-    rows = [r.get() for r in res]
-
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows).sort_values(
+        by = 'iv',
+        ascending = False,
+    )
